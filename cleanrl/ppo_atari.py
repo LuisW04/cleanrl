@@ -21,6 +21,44 @@ from cleanrl_utils.atari_wrappers import (  # isort:skip
     NoopResetEnv,
 )
 
+from cleanrl_utils.dataset_collector import DatasetCollector
+from cleanrl_utils.support_models import MsPacmanModel, MsPacmanTransformer
+from cleanrl_utils.context_buffer import ContextBuffer
+from ocatari.core import OCAtari
+
+
+# Labels :
+# 0. num_frames until truncation
+# 1. num_frames until hp decrease (truncation/termination)
+# 2. num_frames until caught by ghost 0 
+# 3. num_frames until caught by ghost 1 
+# 4. num_frames until caught by ghost 2 
+# 5. num_frames until caught by ghost 3
+# 6. num_frames until powerpill 0 collected
+# 7. num_frames until powerpill 1 collected
+# 8. num_frames until powerpill 2 collected
+# 9. num_frames until powerpill 3 collected
+# 10. num_frames until fruit collected
+# 11. num_frames until pill count increase
+# 12. num_frames until next lvl (=pill count reset)
+# 13. dist player to ghost 0
+# 14. dist player to ghost 1
+# 15. dist player to ghost 2
+# 16. dist player to ghost 3
+# 17. dist player to fruit
+# 18. dist player to powerpill 0
+# 19. dist player to powerpill 1
+# 20. dist player to powerpill 2
+# 21. dist player to powerpill 3
+
+use_support_model = True
+critic_only_support_model = False
+collect_data = False
+support_model_name = "transformer_acts_shifted.pt" #"model_20_files.pt"
+#feature mask can be used to not overwhelm the model with useless info
+feature_mask = np.array(range(22)) #np.array([5]) #np.array([range(2, 6)]) #np.array([1]) #np.array(range(6)) #np.array(range(22))
+save_model_interval = 200000
+last_save_global_step = 0
 
 @dataclass
 class Args:
@@ -88,11 +126,17 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name):
     def thunk():
+        env = OCAtari(env_id, mode="ram", hud=True, obs_mode="ori",  render_mode="rgb_array")
+        env.ale = env._ale 
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        '''
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+        '''
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env, noop_max=30)
         env = MaxAndSkipEnv(env, skip=4)
@@ -115,8 +159,9 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, use_support_model = False, feature_mask = None):
         super().__init__()
+        self.use_support_model = use_support_model
         self.network = nn.Sequential(
             layer_init(nn.Conv2d(4, 32, 8, stride=4)),
             nn.ReLU(),
@@ -128,14 +173,23 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
+        self.prediction_network = nn.Sequential(
+            layer_init(nn.Linear(512 + len(feature_mask), 512)),
+            nn.ReLU()
+        )
         self.actor = layer_init(nn.Linear(512, envs.single_action_space.n), std=0.01)
         self.critic = layer_init(nn.Linear(512, 1), std=1)
 
-    def get_value(self, x):
-        return self.critic(self.network(x / 255.0))
-
-    def get_action_and_value(self, x, action=None):
+    def get_value(self, x, prediction=None):
         hidden = self.network(x / 255.0)
+        if self.use_support_model:
+            hidden = self.prediction_network(torch.cat([hidden, prediction], dim=1))
+        return self.critic(hidden)
+
+    def get_action_and_value(self, x, prediction=None, action=None):
+        hidden = self.network(x / 255.0)
+        if self.use_support_model and not critic_only_support_model:
+            hidden = self.prediction_network(torch.cat([hidden, prediction], dim=1))
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
@@ -175,13 +229,20 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    if use_support_model:
+        #support_model = MsPacmanModel().to(device)
+        support_model = MsPacmanTransformer().to(device)
+        support_model.load_state_dict(torch.load("support_models/%s"%support_model_name))
+        support_model.eval()
+        context_buffer = ContextBuffer(model=support_model, num_envs=args.num_envs, T=16, device=device) #T must be the same as the one used for the support transformer
+
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, use_support_model, feature_mask).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -191,6 +252,15 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    if use_support_model:
+        predictions = torch.zeros((args.num_steps, args.num_envs, len(feature_mask))).to(device)
+    if collect_data:
+        dataset_collector = DatasetCollector(
+            buffer_size=50000, 
+            num_envs=args.num_envs, 
+            obs_space=envs.single_observation_space, 
+            action_space=envs.single_action_space, 
+        )
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -198,6 +268,12 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    if use_support_model:
+        next_prediction = context_buffer.step(next_obs)
+    else:
+        next_prediction = None
+    if use_support_model:
+        last_action = torch.zeros((args.num_envs,) + envs.single_action_space.shape).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -210,17 +286,42 @@ if __name__ == "__main__":
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
+            if use_support_model:
+                #prediction = context_buffer.step(next_obs)[:, feature_mask]    #support_model(next_obs, last_action)[:, feature_mask]
+                predictions[step] = next_prediction #prediction
+            #else:
+            #    prediction = None
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(next_obs, next_prediction)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
+            if use_support_model:
+                last_action = action
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             next_done = np.logical_or(terminations, truncations)
+            if use_support_model:
+                context_buffer.update(action, torch.as_tensor(next_done).to(device))
+                next_prediction = context_buffer.step(torch.as_tensor(next_obs).to(device))
+
+            if collect_data:
+                objects = [e.unwrapped.objects for e in envs.envs]
+                if dataset_collector.full:
+                    print(f"Saving dataset for iteration {iteration}")
+                    dataset_collector.save(folder_path="extracted_data", exp_name=args.exp_name)
+                dataset_collector.add(
+                    obs = obs[step].cpu().numpy(), 
+                    action = actions[step].cpu().numpy(), 
+                    reward = reward, 
+                    terminated=terminations,
+                    truncated=truncations,
+                    objects_per_env = objects
+                )
+
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
@@ -233,7 +334,7 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_obs, next_prediction).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -254,6 +355,8 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+        if use_support_model:
+            b_predictions = predictions.reshape((-1,) + (len(feature_mask),)) if len(feature_mask) != 0 else predictions
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
@@ -264,7 +367,10 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                if use_support_model: 
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_predictions[mb_inds], b_actions.long()[mb_inds])  
+                else:
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], None, b_actions.long()[mb_inds])  
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -325,5 +431,15 @@ if __name__ == "__main__":
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+        #print("test: ", global_step, save_model_interval, global_step % save_model_interval)
+        if global_step >= save_model_interval + last_save_global_step:
+            print("save model, global step:", global_step)
+            last_save_global_step = global_step
+            torch.save(agent.state_dict(), f"runs/{run_name}/model.pt")
+    torch.save(agent.state_dict(), f"runs/{run_name}/model.pt")
     envs.close()
+
+    if collect_data:
+        dataset_collector.save(folder_path="extracted_data", exp_name=args.exp_name)
+
     writer.close()

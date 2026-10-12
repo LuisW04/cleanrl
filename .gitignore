@@ -1,5 +1,7 @@
 slurm
 .aim
+extracted_data
+support_models
 runs
 balance_bot.xml
 cleanrl/ppo_continuous_action_isaacgym/isaacgym/examples

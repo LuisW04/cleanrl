@@ -2,8 +2,8 @@ import torch
 import numpy as np
 
 class ContextBuffer:
-    def __init__(self, model, num_envs, T, device):
-        self.model, self.T = model, T
+    def __init__(self, model, num_envs, T, device, feature_mask):
+        self.model, self.T, self.feature_mask = model, T, feature_mask
         self.emb = torch.zeros(num_envs, T, model.d_model, device=device)
         self.act = torch.zeros(num_envs, T, dtype=torch.long, device=device)
         self.n = torch.zeros(num_envs, dtype=torch.long, device=device) #current window size per env, 0 <= n <= T
@@ -21,7 +21,7 @@ class ContextBuffer:
         self.act[self.all_envs, pos] = self.new_action
         self.n = (self.n + 1).clamp(max=self.T)
         out = self.model.head(self.emb, self.act)
-        return out[self.all_envs, self.n -1].sigmoid()
+        return out[self.all_envs, self.n -1].sigmoid()[:, self.feature_mask]
 
     def update(self, action, done):
         self.new_action = action.clone()

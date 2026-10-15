@@ -54,9 +54,9 @@ from ocatari.core import OCAtari
 use_support_model = True
 critic_only_support_model = False
 collect_data = False
-support_model_name = "transformer_acts_shifted.pt" #"model_20_files.pt"
+support_model_name = "trans_diverse_data.pt" #"transformer_acts_shifted.pt" #"model_20_files.pt"
 #feature mask can be used to not overwhelm the model with useless info
-feature_mask = np.array(range(22)) #np.array([5]) #np.array([range(2, 6)]) #np.array([1]) #np.array(range(6)) #np.array(range(22))
+feature_mask = np.array([6, 7, 8, 9]) #np.array(range(6)) #np.array(range(22))
 save_model_interval = 200000
 last_save_global_step = 0
 
@@ -234,7 +234,7 @@ if __name__ == "__main__":
         support_model = MsPacmanTransformer().to(device)
         support_model.load_state_dict(torch.load("support_models/%s"%support_model_name))
         support_model.eval()
-        context_buffer = ContextBuffer(model=support_model, num_envs=args.num_envs, T=16, device=device) #T must be the same as the one used for the support transformer
+        context_buffer = ContextBuffer(model=support_model, num_envs=args.num_envs, T=16, device=device, feature_mask=feature_mask) #T must be the same as the one used for the support transformer
 
     # env setup
     envs = gym.vector.SyncVectorEnv(

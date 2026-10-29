@@ -51,9 +51,9 @@ from ocatari.core import OCAtari
 # 20. dist player to powerpill 2
 # 21. dist player to powerpill 3
 
-use_support_model = True
+use_support_model = False
 critic_only_support_model = False
-collect_data = False
+collect_data = True
 support_model_name = "trans_diverse_data.pt" #"transformer_acts_shifted.pt" #"model_20_files.pt"
 #feature mask can be used to not overwhelm the model with useless info
 feature_mask = np.array([6, 7, 8, 9]) #np.array(range(6)) #np.array(range(22))
@@ -255,12 +255,18 @@ if __name__ == "__main__":
     if use_support_model:
         predictions = torch.zeros((args.num_steps, args.num_envs, len(feature_mask))).to(device)
     if collect_data:
+        envs.reset(seed=args.seed)
+        ocatari_instance = envs.envs[0].unwrapped
+        num_objects = len(ocatari_instance.objects)
         dataset_collector = DatasetCollector(
             buffer_size=50000, 
             num_envs=args.num_envs, 
             obs_space=envs.single_observation_space, 
             action_space=envs.single_action_space, 
+            num_objects=num_objects
         )
+        
+        dataset_collector.create_metadata(ocatari_instance, "extracted_data", args.exp_name)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -308,8 +314,20 @@ if __name__ == "__main__":
                 context_buffer.update(action, torch.as_tensor(next_done).to(device))
                 next_prediction = context_buffer.step(torch.as_tensor(next_obs).to(device))
 
+            #objects = [e.unwrapped.objects for e in envs.envs]
+            #new_name = False
+            #for env_objects in objects:
+            #    for i, objct in enumerate(env_objects):
+            #        if obj_names[i] == '' and objct.category != 'NoObject':
+            #            obj_names[i] = objct.category
+            #            new_name = True
+            #if new_name:
+            #    print("obj names: ", obj_names)
+                        
+
             if collect_data:
                 objects = [e.unwrapped.objects for e in envs.envs]
+                
                 if dataset_collector.full:
                     print(f"Saving dataset for iteration {iteration}")
                     dataset_collector.save(folder_path="extracted_data", exp_name=args.exp_name)

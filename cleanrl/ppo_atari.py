@@ -22,8 +22,11 @@ from cleanrl_utils.atari_wrappers import (  # isort:skip
 )
 
 from cleanrl_utils.dataset_collector import DatasetCollector
-from cleanrl_utils.support_models import MsPacmanModel, MsPacmanTransformer
+from cleanrl_utils.support_models import PredictionTransformer
 from cleanrl_utils.context_buffer import ContextBuffer
+import json
+import dataclasses
+import sys
 from ocatari.core import OCAtari
 
 
@@ -51,12 +54,12 @@ from ocatari.core import OCAtari
 # 20. dist player to powerpill 2
 # 21. dist player to powerpill 3
 
-use_support_model = False
+use_support_model = True
 critic_only_support_model = False
-collect_data = True
-support_model_name = "trans_diverse_data.pt" #"transformer_acts_shifted.pt" #"model_20_files.pt"
+collect_data = False
+support_model_name =  "sq_llm" #"sq_seqlen32"
 #feature mask can be used to not overwhelm the model with useless info
-feature_mask = np.array([6, 7, 8, 9]) #np.array(range(6)) #np.array(range(22))
+feature_mask = np.array(range(5)) #np.array([6, 7, 8, 9]) #np.array(range(6)) #np.array(range(22))
 save_model_interval = 200000
 last_save_global_step = 0
 
@@ -229,13 +232,6 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    if use_support_model:
-        #support_model = MsPacmanModel().to(device)
-        support_model = MsPacmanTransformer().to(device)
-        support_model.load_state_dict(torch.load("support_models/%s"%support_model_name))
-        support_model.eval()
-        context_buffer = ContextBuffer(model=support_model, num_envs=args.num_envs, T=16, device=device, feature_mask=feature_mask) #T must be the same as the one used for the support transformer
-
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
@@ -245,6 +241,24 @@ if __name__ == "__main__":
     agent = Agent(envs, use_support_model, feature_mask).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    if use_support_model:
+        config = json.load(open(f"support_models/{support_model_name}_model_config.json"))
+        support_model = PredictionTransformer(n_labels=config["n_labels"], n_actions=config["n_actions"], max_len=config["seq_len"], d_model=config["d_model"]).to(device)
+        support_model.load_state_dict(torch.load(f"support_models/{support_model_name}.pt"))
+        support_model.eval()
+        context_buffer = ContextBuffer(model=support_model, num_envs=args.num_envs, T=config["seq_len"], device=device, feature_mask=feature_mask) 
+
+    #saving args
+    with open(f"runs/{run_name}/args.txt", "w") as f:
+        f.write("command: "+ " ".join(sys.argv) + "\n\n")
+        for k, v in dataclasses.asdict(args).items():
+            f.write(f"{k}: {v}\n")
+        f.write(f"\nuse support model: {use_support_model}\n")
+        f.write(f"critic only support model: {critic_only_support_model}\n")
+        f.write(f"collect data: {collect_data}\n")
+        f.write(f"support model name: {support_model_name}\n")
+        f.write(f"feature mask: {feature_mask}")
+    
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)

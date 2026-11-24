@@ -1,6 +1,48 @@
 import torch.nn as nn
 import torch
 
+class PredictionTransformer(nn.Module):
+    def __init__(self, n_labels, n_actions=9, d_model=256, n_heads=4, n_layers=2, max_len=16, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.obs_network = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Flatten(), nn.Linear(64 * 7 *7, d_model)
+        )
+        self.action_emb = nn.Embedding(n_actions, d_model)
+        self.positional_emb = nn.Parameter(torch.zeros(1, max_len, d_model))
+        nn.init.normal_(self.positional_emb, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward= 4*d_model, 
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(layer, n_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(d_model)
+
+        self.output_network = nn.Sequential( 
+            nn.Linear(d_model, 512), nn.ReLU(),
+            nn.Linear(512, n_labels) 
+        )
+
+    def encode(self, obs):
+        x = self.obs_network(obs.reshape(-1, *obs.shape[-3:]).float()/255.0)
+        return x.reshape(*obs.shape[:-3], -1)
+
+    def head(self, emb, action):
+        t = emb.shape[1] #dim 0 is envs
+        a = self.action_emb(action.long())
+        x = emb + a + self.positional_emb[:, :t]
+        mask = nn.Transformer.generate_square_subsequent_mask(t, device=x.device)
+        x = self.transformer(x, mask=mask, is_causal=True)
+        x = self.norm(x)
+        return self.output_network(x)
+    
+    def forward(self, obs, action):
+        return self.head(self.encode(obs), action)
+
+
 
 class MsPacmanTransformer(nn.Module):
     def __init__(self, n_actions=9, d_model=256, n_heads=4, n_layers=2, max_len=16, dropout=0.1):
